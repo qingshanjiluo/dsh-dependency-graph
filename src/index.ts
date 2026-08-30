@@ -15,7 +15,6 @@
 import z from 'zod';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, extname, relative } from 'node:path';
-import { execSync } from 'node:child_process';
 
 export const name = 'dsh-dependency-graph';
 
