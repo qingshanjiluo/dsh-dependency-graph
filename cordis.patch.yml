@@ -1,0 +1,5 @@
+- insert:
+    - id: dependency-graph
+      name: dsh-dependency-graph
+      config:
+        enabled: true
