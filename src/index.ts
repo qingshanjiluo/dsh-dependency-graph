@@ -1,3 +1,17 @@
+/**
+ * dsh-dependency-graph — 依赖图分析
+ *
+ * 功能：
+ * 1. 模块依赖可视化
+ * 2. 循环检测
+ * 3. 孤儿模块
+ * 4. 影响分析
+ * 5. 耦合度计算
+ *
+ * 工具：dep_graph, dep_circular, dep_orphans, dep_impact, dep_coupling, dep_package
+ * 命令：/dep
+ * 配置：enabled
+ */
 import z from 'zod';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, extname, relative } from 'node:path';
