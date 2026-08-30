@@ -1,117 +1,57 @@
 import React from 'react';
 
-export const inject = ['settingsScope', 'slots', 'locale'] as const;
-
-const en = {
-  'depGraph.title': 'Dependency Graph',
-  'depGraph.enabled': 'Enable dependency graph plugin',
-  'depGraph.maxDepth': 'Max walk depth',
-  'depGraph.description': 'Analyzes project dependencies, detects circular deps, orphans, and coupling metrics.',
-};
+const NS = 'dependency-graph';
 
 const zh = {
-  'depGraph.title': '依赖图谱',
-  'depGraph.enabled': '启用依赖图谱插件',
-  'depGraph.maxDepth': '最大遍历深度',
-  'depGraph.description': '分析项目依赖关系，检测循环依赖、孤立模块和耦合指标。',
+  title: '依赖图谱',
+  description: '分析项目依赖关系，检测循环依赖、孤立模块和耦合指标',
+  enabled: '启用插件',
+  maxDepth: '最大遍历深度',
 };
 
+const en = {
+  title: 'Dependency Graph',
+  description: 'Analyzes project dependencies, detects circular deps, orphans, and coupling metrics',
+  enabled: 'Enable plugin',
+  maxDepth: 'Max walk depth',
+};
+
+export const inject = ['settingsScope', 'slots', 'locale'];
+
 export function apply(ctx: any) {
-  const { settingsScope, locale } = ctx;
-
-  if (locale?.register) {
-    locale.register('en', en);
-    locale.register('zh', zh);
-  }
-
-  if (settingsScope?.registerCard) {
-    settingsScope.registerCard('dsh-dependency-graph', function DepGraphCard() {
-      const [enabled, setEnabled] = React.useState<boolean>(
-        settingsScope.get('dsh-dependency-graph')?.enabled ?? true
-      );
-      const [maxDepth, setMaxDepth] = React.useState<number>(
-        settingsScope.get('dsh-dependency-graph')?.maxDepth ?? 5
-      );
-
-      React.useEffect(() => {
-        settingsScope.set('dsh-dependency-graph', { enabled, maxDepth });
-      }, [enabled, maxDepth]);
-
-      return React.createElement(
-        'div',
-        { style: { padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' } },
-        React.createElement(
-          'div',
-          { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-          React.createElement(
-            'div',
-            { style: { display: 'flex', flexDirection: 'column' } },
-            React.createElement('span', { style: { fontWeight: 600, fontSize: '14px' } }, 'Dependency Graph'),
-            React.createElement('span', { style: { fontSize: '12px', color: '#888', marginTop: '2px' } }, 'Analyze project module dependencies')
-          ),
-          React.createElement(
-            'label',
-            { style: { position: 'relative', display: 'inline-block', width: '44px', height: '24px', cursor: 'pointer' } },
-            React.createElement('input', {
-              type: 'checkbox',
-              checked: enabled,
-              onChange: (e: React.ChangeEvent<HTMLInputElement>) => setEnabled(e.target.checked),
-              style: { opacity: 0, width: 0, height: 0 },
-            }),
-            React.createElement(
-              'span',
-              {
-                style: {
-                  position: 'absolute',
-                  inset: 0,
-                  backgroundColor: enabled ? '#3b82f6' : '#555',
-                  borderRadius: '12px',
-                  transition: 'background-color 0.2s',
-                },
-              },
-              React.createElement('span', {
-                style: {
-                  position: 'absolute',
-                  left: enabled ? '22px' : '2px',
-                  top: '2px',
-                  width: '20px',
-                  height: '20px',
-                  backgroundColor: '#fff',
-                  borderRadius: '50%',
-                  transition: 'left 0.2s',
-                },
-              })
-            )
-          )
-        ),
-        React.createElement(
-          'div',
-          { style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
-          React.createElement('label', { style: { fontSize: '13px', color: '#aaa' } }, 'Max Depth'),
-          React.createElement(
-            'div',
-            { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-            React.createElement('input', {
-              type: 'range',
-              min: 1,
-              max: 20,
-              value: maxDepth,
-              onChange: (e: React.ChangeEvent<HTMLInputElement>) => setMaxDepth(parseInt(e.target.value, 10)),
-              style: { flex: 1, accentColor: '#3b82f6' },
-            }),
-            React.createElement(
-              'span',
-              { style: { minWidth: '24px', textAlign: 'right', fontSize: '13px', fontWeight: 600 } },
-              String(maxDepth)
-            )
-          )
-        ),
-        React.createElement(
-          'p',
-          { style: { fontSize: '12px', color: '#666', margin: 0, lineHeight: '1.5' } },
-          'Detects circular dependencies, orphan modules, coupling metrics, and can generate Mermaid/DOT visualizations.'
-        )
-      );
+  ctx.effect?.(() => ctx.locale?.register?.(NS, { zh, en }), `dsh-${NS}: locale`);
+  ctx.effect?.(() => {
+    ctx.slots?.inject?.('settings.plugin.item', function* () {
+      yield ctx.slots.register({ name: 'settings.plugin.item', key: NS, locale: NS, inject: () => ({}) }, Card);
     });
-  }
+  }, `dsh-${NS}: settings`);
+}
+
+function Card(props: any) {
+  const { scope, t } = props;
+  const [open, setOpen] = React.useState(false);
+  const s = { background: '#1a1a2e', color: '#e0e0e0', borderRadius: '8px', padding: '12px', marginBottom: '8px', border: '1px solid #333' } as React.CSSProperties;
+  const row = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', cursor: 'pointer', borderRadius: '4px', transition: 'background 0.15s' } as React.CSSProperties;
+  const label = { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px' } as React.CSSProperties;
+
+  return React.createElement('li', { className: `dsh-${NS}-card`, style: s },
+    React.createElement('div', { style: row, onClick: () => setOpen(!open), onMouseEnter: (e: any) => e.currentTarget.style.background = '#252540', onMouseLeave: (e: any) => e.currentTarget.style.background = 'transparent' },
+      React.createElement('div', null,
+        React.createElement('strong', { style: { fontSize: '14px' } }, '\uD83D\uDD17 ', t('title')),
+        React.createElement('p', { style: { margin: '2px 0 0', fontSize: '12px', color: '#888' } }, t('description')),
+      ),
+      React.createElement('span', { style: { fontSize: '12px', color: '#888' } }, open ? '\u25B2' : '\u25BC'),
+    ),
+    open ? React.createElement('div', { style: { padding: '8px 0', borderTop: '1px solid #333' } },
+      React.createElement('label', { style: label },
+        React.createElement('input', { type: 'checkbox', checked: scope?.get?.('enabled') ?? true, onChange: (e: any) => scope?.set?.('enabled', e.target.checked) }),
+        t('enabled'),
+      ),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px' } },
+        React.createElement('label', { style: { fontSize: '13px', minWidth: '120px' } }, t('maxDepth')),
+        React.createElement('input', { type: 'range', min: 1, max: 20, value: scope?.get?.('maxDepth') ?? 5, onChange: (e: any) => scope?.set?.('maxDepth', Number(e.target.value)), style: { flex: 1, accentColor: '#4fc3f7' } }),
+        React.createElement('span', { style: { minWidth: '24px', textAlign: 'right', fontSize: '13px', fontWeight: 600 } }, String(scope?.get?.('maxDepth') ?? 5)),
+      ),
+    ) : null,
+  );
 }
