@@ -1,49 +1,40 @@
 # dsh-dependency-graph
 
-> DeepSeek Harness 依赖图分析
+Dependency-graph analysis for DeepSeek Harness: circular-dependency detection, orphan (unused) lookups, and change-impact analysis over caller-supplied import graphs. Pure graph algorithms — the model supplies edges (`{from,to}` pairs, e.g. from an import map or a package.json `dependencies` object); the plugin runs no subprocesses, reads no files, and touches no network.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-## ✨ 功能特性
-
-- 📊 **依赖图可视化**: Mermaid/DOT/文本格式
-- 🔄 **循环检测**: 发现循环依赖
-- 🏝️ **孤儿模块**: 未被导入的模块
-- 💥 **影响分析**: 修改模块的影响范围
-- 📈 **耦合指标**: 计算 Afferent/Efferent 耦合度
-
-## 📦 安装
+## Install
 
 ```bash
-npm install dsh-dependency-graph
+npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-dependency-graph
 ```
 
-## 🛠️ 工具
+## Tools
 
-| 工具名 | 描述 | 参数 |
-|--------|------|------|
-| `dep_graph` | 构建依赖图 | `path`, `format` |
-| `dep_circular` | 检测循环依赖 | `path` |
-| `dep_orphans` | 查找孤儿模块 | `path` |
-| `dep_impact` | 影响分析 | `module` |
-| `dep_coupling` | 耦合度分析 | `path` |
-| `dep_package` | 分析 package.json | `path` |
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `dep_circular` | `edges: {from,to}[]` | `cyclic`, `found`, `truncated`, `cycles` — distinct cycles as closed node paths, shortest first, capped by `maxCycles` |
+| `dep_orphans` | `nodes: string[]`, `edges: {from,to}[]` | `declared`, `orphans` (nodes in no edge at all), `unreferenced` (import others but are never imported; entry points exempt) |
+| `dep_impact` | `node: string`, `edges: {from,to}[]` | `found`, `impacted`, direct/transitive dependents and dependencies (upstream = breaks, downstream = used) |
 
-## 📋 命令
+Edge convention: `{from: "a", to: "b"}` means **a imports/depends on b**. For a package.json `dependencies` object, emit one edge per (package name → each of its dependencies).
 
-- `/dep graph` — 依赖图
-- `/dep circular` — 循环检测
-- `/dep orphans` — 孤儿模块
-- `/dep impact <module>` — 影响分析
-- `/dep coupling` — 耦合度
+## Configuration
 
-## ⚙️ 配置
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `maxCycles` | number | `50` | Cycle-report budget for `dep_circular` (extra cycles are counted but truncated) |
+| `entryPoints` | string[] | `[]` | Nodes allowed to import without being imported back (e.g. `src/main.ts`) |
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enabled` | boolean | `true` | 启用插件 |
-| `maxDepth` | number | `5` | 最大遍历深度 |
+## Development
 
-## 📄 License
+```bash
+npm install --no-audit --no-fund
+npx tsc --noEmit
+npm run build
+npx vitest run
+node scripts/load-smoke.mjs
+```
+
+## License
 
 MIT

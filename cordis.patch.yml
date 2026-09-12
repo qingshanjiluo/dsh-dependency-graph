@@ -1,5 +1,9 @@
+# dsh-dependency-graph bundle layer: inserts the host tool plugin into a
+# profile's layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-dependency-graph
 - insert:
     - id: dependency-graph
-      name: dsh-dependency-graph
+      name: '@qingshanjiluo/dsh-dependency-graph'
       config:
-        enabled: true
+        maxCycles: 50
+        entryPoints: []

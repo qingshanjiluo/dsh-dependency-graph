@@ -1,620 +1,370 @@
 /**
- * dsh-dependency-graph — 依赖图分析
- *
- * 功能：
- * 1. 模块依赖可视化
- * 2. 循环检测
- * 3. 孤儿模块
- * 4. 影响分析
- * 5. 耦合度计算
- *
- * 工具：dep_graph, dep_circular, dep_orphans, dep_impact, dep_coupling, dep_package
- * 命令：/dep
- * 配置：enabled
+ * Dependency-graph analysis for DeepSeek Harness. Three pure tools operate on
+ * caller-supplied directed edges ({from, to} meaning "from imports/depends on
+ * to", e.g. built from an import map or a package.json dependencies object):
+ * `dep_circular` finds distinct dependency cycles, `dep_orphans` finds declared
+ * nodes nothing depends on, and `dep_impact` reports the blast radius of
+ * changing one node. The plugin shells out to nothing and reads no files — the
+ * model supplies the graph, so every result is deterministic.
+ * @module @qingshanjiluo/dsh-dependency-graph
  */
-import z from 'zod';
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { resolve, join, extname, relative } from 'node:path';
 
-export const name = 'dsh-dependency-graph';
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-export const inject = ['settings', 'tools', 'commands'] as const;
+export const name = 'dsh-dependency-graph'
+export const inject = ['tools']
 
-export const config = z.object({
-  enabled: z.boolean().default(true),
-  maxDepth: z.number().int().min(1).max(20).default(5),
-  ignorePatterns: z.string().default('node_modules,.git,dist,build'),
-});
-
-type GraphNode = {
-  imports: Set<string>;
-  importedBy: Set<string>;
-  size: number;
-};
-
-type Graph = Map<string, GraphNode>;
-
-type CircularChain = string[];
-
-type CouplingMetrics = {
-  module: string;
-  afferentCoupling: number;
-  efferentCoupling: number;
-  instability: number;
-};
-
-type PackageAnalysis = {
-  dependencies: Record<string, string>;
-  devDependencies: Record<string, string>;
-  used: string[];
-  unused: string[];
-  missing: string[];
-};
-
-const IMPORT_PATTERNS: Record<string, RegExp[]> = {
-  typescript: [
-    /import\s+.*?\s+from\s+['"]([^'"]+)['"]/g,
-    /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-    /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-    /export\s+.*?\s+from\s+['"]([^'"]+)['"]/g,
-  ],
-  javascript: [
-    /import\s+.*?\s+from\s+['"]([^'"]+)['"]/g,
-    /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-    /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-  ],
-  python: [
-    /from\s+([^\s]+)\s+import/g,
-    /import\s+([^\s;]+)/g,
-  ],
-  rust: [
-    /use\s+([^\s;]+)::/g,
-    /mod\s+([^\s;]+);/g,
-  ],
-  go: [
-    /import\s+["']([^"']+)["']/g,
-    /import\s*\([\s\S]*?["']([^"']+)["']/g,
-  ],
-};
-
-function getLangFromExt(filePath: string): string {
-  const ext = extname(filePath);
-  const map: Record<string, string> = {
-    '.ts': 'typescript',
-    '.tsx': 'typescript',
-    '.js': 'javascript',
-    '.jsx': 'javascript',
-    '.mjs': 'javascript',
-    '.cjs': 'javascript',
-    '.py': 'python',
-    '.rs': 'rust',
-    '.go': 'go',
-  };
-  return map[ext] || 'typescript';
+/** Deployment policy for the graph tools. */
+export interface Config {
+  /**
+   * Maximum number of distinct cycles `dep_circular` returns. The scan still
+   * counts every cycle it finds, but the reported list is truncated to this
+   * budget and flagged with `truncated: true`.
+   */
+  maxCycles: number
+  /**
+   * Node names that are allowed to import others without being imported back
+   * (application entry points such as `src/main.ts`). `dep_orphans` never
+   * lists these as unreferenced.
+   */
+  entryPoints: string[]
 }
 
-function parseImports(content: string, lang: string): string[] {
-  const patterns = IMPORT_PATTERNS[lang] || IMPORT_PATTERNS.typescript;
-  const imports: string[] = [];
-  for (const pattern of patterns) {
-    const regex = new RegExp(pattern.source, pattern.flags);
-    let match;
-    while ((match = regex.exec(content)) !== null) {
-      const specifier = match[1];
-      if (specifier && (specifier.startsWith('.') || specifier.startsWith('/'))) {
-        imports.push(specifier);
-      }
-    }
+/** Schemastery configuration for the dependency-graph tools. */
+export const Config: z<Config> = z.object({
+  maxCycles: z.number().default(50),
+  entryPoints: z.array(z.string()).default([]),
+})
+
+/** One directed import edge: source depends on target. */
+interface Edge {
+  from: string
+  to: string
+}
+
+/**
+ * Build a deduplicated, deterministically ordered adjacency map. Nodes with no
+ * outgoing edges still get an (empty) entry so lookups stay total.
+ * @param edges - caller-supplied directed edges.
+ * @returns adjacency map keyed by node name, targets sorted.
+ */
+function buildAdjacency(edges: readonly Edge[]): Map<string, string[]> {
+  const adjacency = new Map<string, string[]>()
+  const seen = new Set<string>()
+  for (const { from, to } of edges) {
+    if (!adjacency.has(from)) adjacency.set(from, [])
+    if (!adjacency.has(to)) adjacency.set(to, [])
+    const key = JSON.stringify([from, to])
+    if (seen.has(key)) continue
+    seen.add(key)
+    adjacency.get(from)!.push(to)
   }
-  return imports;
+  for (const targets of adjacency.values()) targets.sort()
+  return adjacency
 }
 
-function shouldIgnore(filePath: string, patterns: string[]): boolean {
-  const parts = filePath.split(/[/\\]/);
-  return parts.some((part) => patterns.includes(part));
-}
-
-function walkDirectory(dir: string, patterns: string[]): string[] {
-  const results: string[] = [];
-  if (!existsSync(dir)) return results;
-
-  const entries = readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name);
-    if (shouldIgnore(fullPath, patterns)) continue;
-
-    if (entry.isDirectory()) {
-      results.push(...walkDirectory(fullPath, patterns));
-    } else if (entry.isFile()) {
-      const ext = extname(entry.name);
-      if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.rs', '.go'].includes(ext)) {
-        results.push(fullPath);
-      }
-    }
+/**
+ * Rotate a cycle body so its lexicographically smallest node leads, giving a
+ * stable canonical form independent of where the DFS entered the cycle.
+ * @param body - cycle node sequence without the repeated head.
+ * @returns the rotated sequence and its canonical key.
+ */
+function canonicalCycle(body: readonly string[]): { rotated: string[]; key: string } {
+  let min = 0
+  for (let i = 1; i < body.length; i++) {
+    if ((body[i] ?? '') < (body[min] ?? '')) min = i
   }
-  return results;
+  const rotated = [...body.slice(min), ...body.slice(0, min)]
+  return { rotated, key: JSON.stringify(rotated) }
 }
 
-function resolveImport(fromFile: string, importPath: string): string | null {
-  const dir = fromFile;
-  const candidates = [
-    resolve(dir, importPath),
-    resolve(dir, importPath + '.ts'),
-    resolve(dir, importPath + '.tsx'),
-    resolve(dir, importPath + '.js'),
-    resolve(dir, importPath + '.jsx'),
-    resolve(dir, importPath + '.mjs'),
-    resolve(dir, importPath + '.index.ts'),
-    resolve(dir, importPath + '.index.js'),
-    resolve(dir, importPath, 'index.ts'),
-    resolve(dir, importPath, 'index.js'),
-    resolve(dir, importPath, 'index.tsx'),
-    resolve(dir, importPath, 'index.jsx'),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-function buildGraph(dir: string, depth: number, patterns: string[], currentDepth = 0, graph: Graph = new Map(), visited = new Set<string>()): Graph {
-  if (currentDepth >= depth) return graph;
-
-  const files = walkDirectory(dir, patterns);
-  for (const file of files) {
-    if (visited.has(file)) continue;
-    visited.add(file);
-
-    const content = readFileSync(file, 'utf-8');
-    const lang = getLangFromExt(file);
-    const importSpecifiers = parseImports(content, lang);
-    const stat = statSync(file);
-
-    if (!graph.has(file)) {
-      graph.set(file, { imports: new Set(), importedBy: new Set(), size: stat.size });
-    } else {
-      graph.get(file)!.size = stat.size;
-    }
-
-    for (const spec of importSpecifiers) {
-      const resolved = resolveImport(file, spec);
-      if (resolved) {
-        graph.get(file)!.imports.add(resolved);
-        if (!graph.has(resolved)) {
-          const resolvedStat = existsSync(resolved) ? statSync(resolved) : { size: 0 };
-          graph.set(resolved, { imports: new Set(), importedBy: new Set(), size: resolvedStat.size });
+/**
+ * Enumerate distinct directed cycles via an iterative colored DFS; every back
+ * edge yields one fundamental cycle, deduplicated by canonical rotation.
+ * @param adjacency - deduplicated adjacency from {@link buildAdjacency}.
+ * @returns closed cycle paths (head repeated at the tail), sorted by length
+ * then lexicographically, for deterministic output.
+ */
+function findCycles(adjacency: ReadonlyMap<string, readonly string[]>): string[][] {
+  const WHITE = 0
+  const GRAY = 1
+  const BLACK = 2
+  const color = new Map<string, number>()
+  for (const node of adjacency.keys()) color.set(node, WHITE)
+  const found = new Map<string, string[]>()
+  for (const root of [...adjacency.keys()].sort()) {
+    if (color.get(root) !== WHITE) continue
+    color.set(root, GRAY)
+    const path: string[] = [root]
+    const stack: { node: string; index: number }[] = [{ node: root, index: 0 }]
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!
+      const targets = adjacency.get(frame.node) ?? []
+      if (frame.index < targets.length) {
+        const next = targets[frame.index++]!
+        const state = color.get(next)
+        if (state === GRAY) {
+          const body = path.slice(path.indexOf(next))
+          const { rotated, key } = canonicalCycle(body)
+          if (!found.has(key)) found.set(key, [...rotated, rotated[0]!])
+        } else if (state === WHITE) {
+          color.set(next, GRAY)
+          path.push(next)
+          stack.push({ node: next, index: 0 })
         }
-        graph.get(resolved)!.importedBy.add(file);
+      } else {
+        stack.pop()
+        path.pop()
+        color.set(frame.node, BLACK)
       }
     }
   }
-
-  return graph;
+  return [...found.values()].sort(
+    (a, b) => a.length - b.length || JSON.stringify(a).localeCompare(JSON.stringify(b)),
+  )
 }
 
-function detectCircularDeps(graph: Graph): CircularChain[] {
-  const cycles: CircularChain[] = [];
-  const visited = new Set<string>();
-  const inStack = new Set<string>();
-
-  function dfs(node: string, path: string[]): void {
-    if (inStack.has(node)) {
-      const cycleStart = path.indexOf(node);
-      if (cycleStart !== -1) {
-        cycles.push([...path.slice(cycleStart), node]);
-      }
-      return;
-    }
-    if (visited.has(node)) return;
-
-    visited.add(node);
-    inStack.add(node);
-    path.push(node);
-
-    const nodeData = graph.get(node);
-    if (nodeData) {
-      for (const imp of nodeData.imports) {
-        dfs(imp, path);
-      }
-    }
-
-    path.pop();
-    inStack.delete(node);
-  }
-
-  for (const node of graph.keys()) {
-    dfs(node, []);
-  }
-
-  const seen = new Set<string>();
-  return cycles.filter((cycle) => {
-    const key = cycle.slice(0, -1).sort().join('->');
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function findOrphanModules(graph: Graph): string[] {
-  const orphans: string[] = [];
-  for (const [module, data] of graph) {
-    if (data.importedBy.size === 0) {
-      const isEntry = module.endsWith('index.ts') || module.endsWith('index.js') || module.endsWith('main.ts') || module.endsWith('main.js');
-      if (!isEntry) {
-        orphans.push(module);
-      }
-    }
-  }
-  return orphans;
-}
-
-function calculateCoupling(graph: Graph): CouplingMetrics[] {
-  const metrics: CouplingMetrics[] = [];
-  for (const [module, data] of graph) {
-    const afferent = data.importedBy.size;
-    const efferent = data.imports.size;
-    const total = afferent + efferent;
-    const instability = total > 0 ? efferent / total : 0;
-    metrics.push({
-      module,
-      afferentCoupling: afferent,
-      efferentCoupling: efferent,
-      instability,
-    });
-  }
-  return metrics.sort((a, b) => b.instability - a.instability);
-}
-
-function generateMermaidGraph(graph: Graph): string {
-  const lines = ['graph LR'];
-  const nodeIds = new Map<string, string>();
-  let idCounter = 0;
-
-  for (const node of graph.keys()) {
-    nodeIds.set(node, `n${idCounter++}`);
-  }
-
-  for (const [node, data] of graph) {
-    const id = nodeIds.get(node)!;
-    const label = node.split(/[/\\]/).pop() || node;
-    lines.push(`  ${id}["${label}"]`);
-    for (const imp of data.imports) {
-      if (nodeIds.has(imp)) {
-        lines.push(`  ${id} --> ${nodeIds.get(imp)}`);
-      }
-    }
-  }
-
-  return lines.join('\n');
-}
-
-function generateDotGraph(graph: Graph): string {
-  const lines = ['digraph dependencies {', '  rankdir=LR;', '  node [shape=box];'];
-
-  for (const [node, data] of graph) {
-    const label = node.split(/[/\\]/).pop() || node;
-    const nodeId = `"${node}"`;
-    lines.push(`  ${nodeId} [label="${label}"];`);
-    for (const imp of data.imports) {
-      lines.push(`  ${nodeId} -> "${imp}";`);
-    }
-  }
-
-  lines.push('}');
-  return lines.join('\n');
-}
-
-function generateListGraph(graph: Graph): string {
-  const lines: string[] = [];
-  for (const [node, data] of graph) {
-    const label = node.split(/[/\\]/).pop() || node;
-    const imports = Array.from(data.imports).map((i) => i.split(/[/\\]/).pop() || i);
-    lines.push(`${label} → ${imports.length > 0 ? imports.join(', ') : '(no imports)'} [size: ${data.size}B]`);
-  }
-  return lines.join('\n');
-}
-
-function findImpactSet(module: string, graph: Graph): Set<string> {
-  const affected = new Set<string>();
-  const queue = [module];
-
+/**
+ * Transitive closure over one adjacency map via BFS, excluding the start node
+ * itself so cycles through it never double-report or loop.
+ * @param adjacency - directed adjacency map.
+ * @param start - node to expand from.
+ * @returns sorted direct neighbors and sorted transitive reachables.
+ */
+function closure(
+  adjacency: ReadonlyMap<string, readonly string[]>,
+  start: string,
+): { direct: string[]; transitive: string[] } {
+  const direct = [...(adjacency.get(start) ?? [])].filter(n => n !== start)
+  const seen = new Set<string>()
+  const queue: string[] = [...direct]
   while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (affected.has(current)) continue;
-    affected.add(current);
-
-    for (const [node, data] of graph) {
-      if (data.imports.has(current) && !affected.has(node)) {
-        queue.push(node);
-      }
+    const node = queue.shift()!
+    for (const next of adjacency.get(node) ?? []) {
+      if (next === start || seen.has(next)) continue
+      seen.add(next)
+      queue.push(next)
     }
   }
-
-  affected.delete(module);
-  return affected;
+  return { direct: direct.sort(), transitive: [...seen].sort() }
 }
 
-function analyzePackageJson(dir: string): PackageAnalysis | null {
-  const pkgPath = join(dir, 'package.json');
-  if (!existsSync(pkgPath)) return null;
-
-  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-  const dependencies = pkg.dependencies || {};
-  const devDependencies = pkg.devDependencies || {};
-  const allDeps = { ...dependencies, ...devDependencies };
-
-  const used: string[] = [];
-  const unused: string[] = [];
-  const missing: string[] = [];
-
-  const files = walkDirectory(dir, ['node_modules', '.git', 'dist', 'build']);
-  const importedPackages = new Set<string>();
-
-  for (const file of files) {
-    const content = readFileSync(file, 'utf-8');
-    const lang = getLangFromExt(file);
-    const imports = parseImports(content, lang);
-    for (const imp of imports) {
-      const pkgName = imp.startsWith('@') ? imp.split('/').slice(0, 2).join('/') : imp.split('/')[0];
-      importedPackages.add(pkgName);
+/**
+ * Invert a directed adjacency map (swap dependents and dependencies).
+ * @param adjacency - forward adjacency map.
+ * @returns reverse adjacency map with sorted target lists.
+ */
+function reverseAdjacency(adjacency: ReadonlyMap<string, readonly string[]>): Map<string, string[]> {
+  const reversed = new Map<string, string[]>()
+  for (const node of adjacency.keys()) if (!reversed.has(node)) reversed.set(node, [])
+  for (const [from, targets] of adjacency) {
+    for (const to of targets) {
+      if (!reversed.has(to)) reversed.set(to, [])
+      reversed.get(to)!.push(from)
     }
   }
-
-  for (const dep of Object.keys(allDeps)) {
-    if (importedPackages.has(dep)) {
-      used.push(dep);
-    } else {
-      unused.push(dep);
-    }
-  }
-
-  for (const imp of importedPackages) {
-    if (!allDeps[imp] && !imp.startsWith('.') && !imp.startsWith('/')) {
-      missing.push(imp);
-    }
-  }
-
-  return { dependencies, devDependencies, used, unused, missing };
+  for (const sources of reversed.values()) sources.sort()
+  return reversed
 }
 
-export function apply(settings: any, tools: any, commands: any) {
-  const getConfig = () => {
-    const raw = settings?.get?.('dsh-dependency-graph') || {};
-    return config.parse(raw);
-  };
+const EDGE_ITEMS = {
+  type: 'object' as const,
+  additionalProperties: false,
+  properties: {
+    from: { type: 'string' as const, required: true as const, description: 'Node that imports or depends on the target.' },
+    to: { type: 'string' as const, required: true as const, description: 'Node being imported or depended upon.' },
+  },
+}
 
-  tools.register({
-    name: 'dep_graph',
-    description: 'Build dependency graph for a project and visualize it',
-    parameters: z.object({
-      path: z.string().optional().describe('Project root path'),
-      format: z.enum(['mermaid', 'dot', 'list']).default('list').describe('Output format'),
-    }),
-    execute: async (params: { path?: string; format: string }) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return { error: 'Plugin disabled in settings' };
+const EDGES_DESCRIPTION =
+  'Directed edges as {from,to} pairs, where "from" imports/depends on "to". Build them from an import map or a package.json dependencies object (each key imports each of its values).'
 
-      const dir = params.path || process.cwd();
-      if (!existsSync(dir)) return { error: `Path does not exist: ${dir}` };
-
-      const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-      const graph = buildGraph(dir, cfg.maxDepth, patterns);
-
-      switch (params.format) {
-        case 'mermaid':
-          return { result: generateMermaidGraph(graph) };
-        case 'dot':
-          return { result: generateDotGraph(graph) };
-        case 'list':
-        default:
-          return { result: generateListGraph(graph) };
-      }
-    },
-  });
-
-  tools.register({
+/**
+ * Register the dependency-graph tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's explicit graph-analysis policy.
+ */
+export function apply(ctx: Context, config: Config): void {
+  ctx.tools.register(defineTool({
     name: 'dep_circular',
-    description: 'Detect circular dependencies in the project',
-    parameters: z.object({
-      path: z.string().optional().describe('Project root path'),
-    }),
-    execute: async (params: { path?: string }) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return { error: 'Plugin disabled in settings' };
-
-      const dir = params.path || process.cwd();
-      if (!existsSync(dir)) return { error: `Path does not exist: ${dir}` };
-
-      const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-      const graph = buildGraph(dir, cfg.maxDepth, patterns);
-      const cycles = detectCircularDeps(graph);
-
-      if (cycles.length === 0) {
-        return { result: 'No circular dependencies found.' };
-      }
-
-      const formatted = cycles.map((cycle, i) => {
-        const names = cycle.map((p) => p.split(/[/\\]/).pop() || p);
-        return `Cycle ${i + 1}: ${names.join(' → ')}`;
-      });
-
-      return { result: formatted.join('\n') };
+    description:
+      'Find circular dependencies in a directed import graph. Pass every edge as {from,to} ' +
+      'pairs ("from" imports "to"). Returns each distinct cycle as a closed node path ' +
+      '(first node repeated at the end), up to the configured maxCycles budget.',
+    parameters: {
+      edges: { type: 'array', required: true, description: EDGES_DESCRIPTION, items: EDGE_ITEMS },
     },
-  });
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          cyclic: { type: 'boolean', required: true, description: 'Whether the graph contains at least one cycle.' },
+          found: { type: 'integer', required: true, description: 'Total number of distinct cycles found before truncation.' },
+          truncated: { type: 'boolean', required: true, description: 'Whether more cycles existed than maxCycles allowed to report.' },
+          cycles: {
+            type: 'array',
+            required: true,
+            description: 'Distinct cycles, shortest first; each path closes with a repeat of its first node.',
+            items: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.cyclic
+          ? `${value.found} cycle(s) found${value.truncated ? ` (showing first ${value.cycles.length})` : ''}:\n`
+            + value.cycles.map(c => `- ${c.join(' -> ')}`).join('\n')
+          : 'No circular dependencies.',
+      }],
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const cycles = findCycles(buildAdjacency(args.edges))
+      const limited = cycles.slice(0, Math.max(0, Math.floor(config.maxCycles)))
+      return Promise.resolve({
+        cyclic: cycles.length > 0,
+        found: cycles.length,
+        truncated: limited.length < cycles.length,
+        cycles: limited,
+      })
+    },
+  }))
 
-  tools.register({
+  ctx.tools.register(defineTool({
     name: 'dep_orphans',
-    description: 'Find orphan modules not imported by anything',
-    parameters: z.object({
-      path: z.string().optional().describe('Project root path'),
-    }),
-    execute: async (params: { path?: string }) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return { error: 'Plugin disabled in settings' };
-
-      const dir = params.path || process.cwd();
-      if (!existsSync(dir)) return { error: `Path does not exist: ${dir}` };
-
-      const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-      const graph = buildGraph(dir, cfg.maxDepth, patterns);
-      const orphans = findOrphanModules(graph);
-
-      if (orphans.length === 0) {
-        return { result: 'No orphan modules found.' };
-      }
-
-      const formatted = orphans.map((o) => o.split(/[/\\]/).pop() || o);
-      return { result: `Found ${orphans.length} orphan modules:\n${formatted.join('\n')}` };
+    description:
+      'Find declared nodes nothing depends on. Pass nodes (the names you want checked, e.g. ' +
+      'package names from a package.json dependencies object or source files) and every graph ' +
+      'edge as {from,to} pairs ("from" imports "to"). Orphans appear in no edge at all; ' +
+      'unreferenced nodes import others but are never imported themselves (configured entry ' +
+      'points are exempt).',
+    parameters: {
+      nodes: {
+        type: 'array',
+        required: true,
+        description: 'Declared node names to check, for example dependency package names.',
+        items: { type: 'string' },
+      },
+      edges: { type: 'array', required: true, description: EDGES_DESCRIPTION, items: EDGE_ITEMS },
     },
-  });
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          declared: { type: 'integer', required: true, description: 'Number of distinct declared nodes examined.' },
+          orphans: {
+            type: 'array',
+            required: true,
+            description: 'Declared nodes that appear in no edge at all, sorted.',
+            items: { type: 'string' },
+          },
+          unreferenced: {
+            type: 'array',
+            required: true,
+            description: 'Declared nodes that import others but nothing imports them, sorted.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.orphans.length === 0 && value.unreferenced.length === 0
+          ? `${value.declared} node(s) declared, none orphaned.`
+          : [
+              `${value.declared} node(s) declared:`,
+              value.orphans.length > 0 ? `- orphaned (in no edge): ${value.orphans.join(', ')}` : '',
+              value.unreferenced.length > 0 ? `- unreferenced (never imported): ${value.unreferenced.join(', ')}` : '',
+            ].filter(line => line.length > 0).join('\n'),
+      }],
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const declared = [...new Set(args.nodes)]
+      const sources = new Set<string>()
+      const targets = new Set<string>()
+      for (const { from, to } of args.edges) {
+        sources.add(from)
+        targets.add(to)
+      }
+      const entryPoints = new Set(config.entryPoints)
+      return Promise.resolve({
+        declared: declared.length,
+        orphans: declared.filter(n => !sources.has(n) && !targets.has(n)).sort(),
+        unreferenced: declared
+          .filter(n => sources.has(n) && !targets.has(n) && !entryPoints.has(n))
+          .sort(),
+      })
+    },
+  }))
 
-  tools.register({
+  ctx.tools.register(defineTool({
     name: 'dep_impact',
-    description: 'Analyze the impact of changing a specific module',
-    parameters: z.object({
-      module: z.string().describe('File path of the module to analyze'),
-      path: z.string().optional().describe('Project root path'),
-    }),
-    execute: async (params: { module: string; path?: string }) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return { error: 'Plugin disabled in settings' };
-
-      const dir = params.path || process.cwd();
-      if (!existsSync(dir)) return { error: `Path does not exist: ${dir}` };
-
-      const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-      const graph = buildGraph(dir, cfg.maxDepth, patterns);
-      const targetModule = resolve(dir, params.module);
-
-      if (!graph.has(targetModule)) {
-        return { error: `Module not found in graph: ${params.module}` };
-      }
-
-      const affected = findImpactSet(targetModule, graph);
-
-      if (affected.size === 0) {
-        return { result: `No modules would be affected by changing ${params.module}` };
-      }
-
-      const formatted = Array.from(affected).map((a) => a.split(/[/\\]/).pop() || a);
-      return { result: `Changing ${params.module} would affect ${affected.size} modules:\n${formatted.join('\n')}` };
+    description:
+      'Compute the blast radius of changing one node in a directed import graph. Pass the node ' +
+      'name and every edge as {from,to} pairs ("from" imports "to"). Dependents are nodes that ' +
+      'transitively import the target (they break or need retesting); dependencies are nodes ' +
+      'the target transitively imports.',
+    parameters: {
+      node: { type: 'string', required: true, description: 'Node whose change impact is being measured.' },
+      edges: { type: 'array', required: true, description: EDGES_DESCRIPTION, items: EDGE_ITEMS },
     },
-  });
-
-  tools.register({
-    name: 'dep_coupling',
-    description: 'Calculate coupling metrics for all modules',
-    parameters: z.object({
-      path: z.string().optional().describe('Project root path'),
-    }),
-    execute: async (params: { path?: string }) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return { error: 'Plugin disabled in settings' };
-
-      const dir = params.path || process.cwd();
-      if (!existsSync(dir)) return { error: `Path does not exist: ${dir}` };
-
-      const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-      const graph = buildGraph(dir, cfg.maxDepth, patterns);
-      const metrics = calculateCoupling(graph);
-
-      const formatted = metrics.slice(0, 30).map((m) => {
-        const name = m.module.split(/[/\\]/).pop() || m.module;
-        return `${name} | Afferent: ${m.afferentCoupling} | Efferent: ${m.efferentCoupling} | Instability: ${m.instability.toFixed(2)}`;
-      });
-
-      return { result: `Coupling metrics (top 30 by instability):\n${formatted.join('\n')}` };
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          node: { type: 'string', required: true, description: 'The analyzed node.' },
+          found: { type: 'boolean', required: true, description: 'Whether the node appears in at least one edge.' },
+          impacted: { type: 'integer', required: true, description: 'Total distinct nodes that transitively depend on it.' },
+          directDependents: { type: 'array', required: true, description: 'Nodes importing it directly, sorted.', items: { type: 'string' } },
+          transitiveDependents: { type: 'array', required: true, description: 'Nodes importing it transitively, sorted.', items: { type: 'string' } },
+          directDependencies: { type: 'array', required: true, description: 'Nodes it imports directly, sorted.', items: { type: 'string' } },
+          transitiveDependencies: { type: 'array', required: true, description: 'Nodes it imports transitively, sorted.', items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.found
+          ? [
+              `Changing ${value.node} impacts ${value.impacted} dependent node(s).`,
+              value.directDependents.length > 0 ? `- direct dependents: ${value.directDependents.join(', ')}` : '',
+              value.transitiveDependents.length > 0 ? `- transitive dependents: ${value.transitiveDependents.join(', ')}` : '',
+              value.directDependencies.length > 0 ? `- direct dependencies: ${value.directDependencies.join(', ')}` : '',
+              value.transitiveDependencies.length > 0 ? `- transitive dependencies: ${value.transitiveDependencies.join(', ')}` : '',
+            ].filter(line => line.length > 0).join('\n')
+          : `${value.node} appears in no edge; nothing to analyze.`,
+      }],
     },
-  });
-
-  tools.register({
-    name: 'dep_package',
-    description: 'Analyze package.json for outdated, unused, or missing dependencies',
-    parameters: z.object({
-      path: z.string().optional().describe('Project root path'),
-    }),
-    execute: async (params: { path?: string }) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return { error: 'Plugin disabled in settings' };
-
-      const dir = params.path || process.cwd();
-      if (!existsSync(dir)) return { error: `Path does not exist: ${dir}` };
-
-      const analysis = analyzePackageJson(dir);
-      if (!analysis) {
-        return { error: 'No package.json found in the specified directory' };
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const adjacency = buildAdjacency(args.edges)
+      const found = adjacency.has(args.node)
+      if (!found) {
+        return Promise.resolve({
+          node: args.node,
+          found: false,
+          impacted: 0,
+          directDependents: [],
+          transitiveDependents: [],
+          directDependencies: [],
+          transitiveDependencies: [],
+        })
       }
-
-      const lines: string[] = [];
-      lines.push(`Dependencies: ${Object.keys(analysis.dependencies).length}`);
-      lines.push(`Dev Dependencies: ${Object.keys(analysis.devDependencies).length}`);
-      lines.push(`Used in code: ${analysis.used.length}`);
-
-      if (analysis.unused.length > 0) {
-        lines.push(`\nPossibly unused (${analysis.unused.length}):\n${analysis.unused.join('\n')}`);
-      }
-      if (analysis.missing.length > 0) {
-        lines.push(`\nMissing from package.json (${analysis.missing.length}):\n${analysis.missing.join('\n')}`);
-      }
-
-      return { result: lines.join('\n') };
+      const down = closure(adjacency, args.node)
+      const up = closure(reverseAdjacency(adjacency), args.node)
+      return Promise.resolve({
+        node: args.node,
+        found: true,
+        impacted: up.direct.length + up.transitive.length,
+        directDependents: up.direct,
+        transitiveDependents: up.transitive,
+        directDependencies: down.direct,
+        transitiveDependencies: down.transitive,
+      })
     },
-  });
-
-  commands.register({
-    name: '/dep',
-    description: 'Dependency graph analysis commands',
-    usage: '/dep <graph|circular|orphans|impact|coupling> [path] [module]',
-    execute: async (args: string) => {
-      const cfg = getConfig();
-      if (!cfg.enabled) return 'Plugin disabled in settings';
-
-      const parts = args.trim().split(/\s+/);
-      const subcommand = parts[0];
-      const path = parts[1] || process.cwd();
-
-      switch (subcommand) {
-        case 'graph': {
-          const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-          const graph = buildGraph(path, cfg.maxDepth, patterns);
-          return generateListGraph(graph);
-        }
-        case 'circular': {
-          const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-          const graph = buildGraph(path, cfg.maxDepth, patterns);
-          const cycles = detectCircularDeps(graph);
-          if (cycles.length === 0) return 'No circular dependencies found.';
-          return cycles.map((c, i) => `Cycle ${i + 1}: ${c.map((p) => p.split(/[/\\]/).pop()).join(' → ')}`).join('\n');
-        }
-        case 'orphans': {
-          const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-          const graph = buildGraph(path, cfg.maxDepth, patterns);
-          const orphans = findOrphanModules(graph);
-          if (orphans.length === 0) return 'No orphan modules found.';
-          return `Found ${orphans.length} orphans:\n${orphans.map((o) => o.split(/[/\\]/).pop()).join('\n')}`;
-        }
-        case 'impact': {
-          const module = parts[2];
-          if (!module) return 'Usage: /dep impact <path> <module>';
-          const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-          const graph = buildGraph(path, cfg.maxDepth, patterns);
-          const targetModule = resolve(path, module);
-          const affected = findImpactSet(targetModule, graph);
-          if (affected.size === 0) return `No modules affected by changing ${module}`;
-          return `Changing ${module} affects ${affected.size} modules:\n${Array.from(affected).map((a) => a.split(/[/\\]/).pop()).join('\n')}`;
-        }
-        case 'coupling': {
-          const patterns = cfg.ignorePatterns.split(',').map((p: string) => p.trim());
-          const graph = buildGraph(path, cfg.maxDepth, patterns);
-          const metrics = calculateCoupling(graph);
-          return metrics.slice(0, 20).map((m) => {
-            const name = m.module.split(/[/\\]/).pop() || m.module;
-            return `${name} | Ce: ${m.afferentCoupling} | Ca: ${m.efferentCoupling} | I: ${m.instability.toFixed(2)}`;
-          }).join('\n');
-        }
-        default:
-          return 'Usage: /dep <graph|circular|orphans|impact|coupling> [path] [module]';
-      }
-    },
-  });
+  }))
 }
